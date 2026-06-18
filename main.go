@@ -2,9 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -13,7 +15,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 )
 
 type commandResult struct {
@@ -109,16 +115,66 @@ type diagnosis struct {
 	Recommendations   []string
 }
 
-type ansi struct {
-	Reset   string
-	Bold    string
-	Dim     string
-	Red     string
-	Green   string
-	Yellow  string
-	Blue    string
-	Cyan    string
-	Magenta string
+type testSpec struct {
+	ID          string
+	Title       string
+	Description string
+	Tool        string
+	Command     func(*appModel) (string, string, []string, error)
+	Filter      func(*appModel, string) string
+}
+
+type testState struct {
+	Spec     testSpec
+	Selected bool
+	Status   string
+	Result   commandResult
+}
+
+type commandDoneMsg struct {
+	TestID string
+	Result commandResult
+}
+
+type liveCapture struct {
+	mu      sync.Mutex
+	buf     bytes.Buffer
+	onChunk func(string)
+}
+
+func (l *liveCapture) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n, err := l.buf.Write(p)
+	if n > 0 && l.onChunk != nil {
+		l.onChunk(string(p[:n]))
+	}
+	return n, err
+}
+
+func (l *liveCapture) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+type appModel struct {
+	app         *tview.Application
+	testsTable  *tview.Table
+	outputView  *tview.TextView
+	summaryView *tview.TextView
+	statusView  *tview.TextView
+
+	iface        string
+	gateway      string
+	toolStatuses []toolStatus
+	tests        []testState
+	testIndex    map[string]int
+	results      map[string]commandResult
+
+	running      bool
+	runningIndex int
+	cancelRun    context.CancelFunc
 }
 
 func main() {
@@ -127,19 +183,8 @@ func main() {
 	flag.Parse()
 
 	if os.Geteuid() != 0 {
-		fatalf("this tool requires sudo/root")
-	}
-
-	colors := ansi{
-		Reset:   "\033[0m",
-		Bold:    "\033[1m",
-		Dim:     "\033[2m",
-		Red:     "\033[31m",
-		Green:   "\033[32m",
-		Yellow:  "\033[33m",
-		Blue:    "\033[34m",
-		Cyan:    "\033[36m",
-		Magenta: "\033[35m",
+		fmt.Fprintln(os.Stderr, "error: this tool requires sudo/root")
+		os.Exit(1)
 	}
 
 	requiredTools := []string{"iw", "ip", "ethtool", "nmcli", "lspci", "ping", "dmesg"}
@@ -150,84 +195,564 @@ func main() {
 		var err error
 		iface, err = detectWirelessInterface()
 		if err != nil {
-			fatalf("failed to detect wireless interface: %v", err)
+			fmt.Fprintf(os.Stderr, "error: failed to detect wireless interface: %v\n", err)
+			os.Exit(1)
 		}
 	}
-
-	results := []commandResult{}
 
 	gateway := ""
-	if gatewayRes := runCommand("gateway_route", "ip", "route"); true {
-		results = append(results, gatewayRes)
-		gateway = parseGateway(gatewayRes.Output)
+	if !isToolMissing(toolStatuses, "ip") {
+		routeRes := runCommand("gateway_route", "ip", "route")
+		gateway = parseGateway(routeRes.Output)
 	}
 
-	cmds := []struct {
-		name string
-		bin  string
-		args []string
-	}{
-		{"adapter_info", "ethtool", []string{"-i", iface}},
-		{"link_status", "iw", []string{"dev", iface, "link"}},
-		{"active_connection", "nmcli", []string{"connection", "show", "--active"}},
-		{"nearby_wifi", "nmcli", []string{"-f", "IN-USE,SSID,BSSID,CHAN,RATE,SIGNAL", "dev", "wifi", "list"}},
-		{"power_save", "iw", []string{"dev", iface, "get", "power_save"}},
-		{"station_dump", "iw", []string{"dev", iface, "station", "dump"}},
-		{"driver_stats", "ethtool", []string{"-S", iface}},
-		{"hardware_info", "lspci", []string{"-nnk"}},
-		{"pcie_errors", "dmesg", nil},
+	app := tview.NewApplication()
+	model := newAppModel(app, iface, gateway, toolStatuses)
+
+	if err := app.SetRoot(model.layout(), true).EnableMouse(true).Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func newAppModel(app *tview.Application, iface, gateway string, toolStatuses []toolStatus) *appModel {
+	model := &appModel{
+		app:          app,
+		iface:        iface,
+		gateway:      gateway,
+		toolStatuses: toolStatuses,
+		testIndex:    map[string]int{},
+		results:      map[string]commandResult{},
+		runningIndex: -1,
 	}
 
-	for _, cmd := range cmds {
-		if isToolMissing(toolStatuses, cmd.bin) {
-			results = append(results, commandResult{
-				Name:    cmd.name,
-				Command: strings.Join(append([]string{cmd.bin}, cmd.args...), " "),
-				Skipped: true,
-				Err:     fmt.Errorf("missing required tool: %s", cmd.bin),
-			})
-			continue
+	model.tests = defaultTests()
+	for i := range model.tests {
+		model.tests[i].Selected = true
+		model.tests[i].Status = "pending"
+		model.testIndex[model.tests[i].Spec.ID] = i
+	}
+
+	model.testsTable = tview.NewTable().
+		SetBorders(false).
+		SetSelectable(true, false).
+		SetFixed(1, 0)
+	model.testsTable.SetBorder(true).SetTitle(" Diagnostics ").SetTitleAlign(tview.AlignLeft)
+	model.testsTable.SetSelectedStyle(tcell.StyleDefault.Background(tcell.Color24).Foreground(tcell.ColorWhite))
+	model.testsTable.SetSelectionChangedFunc(func(row, _ int) {
+		if row <= 0 || row-1 >= len(model.tests) {
+			return
 		}
-		results = append(results, runCommand(cmd.name, cmd.bin, cmd.args...))
+		model.showSelectedOutput(row - 1)
+	})
+	model.testsTable.SetInputCapture(model.handleTableKeys)
+
+	model.summaryView = tview.NewTextView().
+		SetDynamicColors(true).
+		SetWrap(true)
+	model.summaryView.SetBorder(true).SetTitle(" Summary ").SetTitleAlign(tview.AlignLeft)
+
+	model.outputView = tview.NewTextView().
+		SetDynamicColors(true).
+		SetScrollable(true).
+		SetWrap(false)
+	model.outputView.SetBorder(true).SetTitle(" Command Output ").SetTitleAlign(tview.AlignLeft)
+
+	model.statusView = tview.NewTextView().
+		SetDynamicColors(true).
+		SetWrap(false)
+	model.statusView.SetBorder(true)
+
+	model.refreshTestsTable()
+	model.refreshSummary()
+	model.refreshStatus("Ready. Select tests with space and press r to run.")
+	model.showSelectedOutput(0)
+
+	app.SetInputCapture(model.handleGlobalKeys)
+	return model
+}
+
+func (m *appModel) layout() tview.Primitive {
+	header := tview.NewTextView().
+		SetDynamicColors(true).
+		SetText(fmt.Sprintf("[::b]wifi-diag[::-]  Interface: [green]%s[-]  Gateway: [green]%s[-]", m.iface, valueOrNA(m.gateway)))
+	header.SetBorder(true).SetTitle(" Wi-Fi Diagnostics ").SetTitleAlign(tview.AlignLeft)
+
+	right := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(m.summaryView, 14, 0, false).
+		AddItem(m.outputView, 0, 1, false)
+
+	body := tview.NewFlex().
+		AddItem(m.testsTable, 44, 0, true).
+		AddItem(right, 0, 1, false)
+
+	root := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(header, 3, 0, false).
+		AddItem(body, 0, 1, true).
+		AddItem(m.statusView, 3, 0, false)
+	return root
+}
+
+func (m *appModel) handleGlobalKeys(event *tcell.EventKey) *tcell.EventKey {
+	switch event.Key() {
+	case tcell.KeyCtrlC:
+		if m.running && m.cancelRun != nil {
+			m.cancelRun()
+		}
+		m.app.Stop()
+		return nil
 	}
 
-	driverName := parseDriver(resultByName(results, "adapter_info").Output)
-	driverLogRes := commandResult{
-		Name:      "driver_logs",
-		Command:   "dmesg",
-		Skipped:   true,
-		ParseNote: "driver name unavailable",
+	switch event.Rune() {
+	case 'q':
+		if m.running && m.cancelRun != nil {
+			m.cancelRun()
+		}
+		m.app.Stop()
+		return nil
+	case 'r':
+		if !m.running {
+			m.runSelected()
+		}
+		return nil
+	case 'a':
+		if !m.running {
+			m.setAllSelected(true)
+		}
+		return nil
+	case 'c':
+		if !m.running {
+			m.setAllSelected(false)
+		} else if m.cancelRun != nil {
+			m.cancelRun()
+		}
+		return nil
 	}
-	if driverName != "" && !isToolMissing(toolStatuses, "dmesg") {
-		driverLogRes = runCommand("driver_logs", "dmesg")
-		driverLogRes.ParseNote = driverName
-	}
-	results = append(results, driverLogRes)
 
-	if gateway != "" && !isToolMissing(toolStatuses, "ping") {
-		results = append(results, runCommand("router_ping", "ping", "-c", "30", gateway))
+	return event
+}
+
+func (m *appModel) handleTableKeys(event *tcell.EventKey) *tcell.EventKey {
+	row, _ := m.testsTable.GetSelection()
+	index := row - 1
+	if index < 0 || index >= len(m.tests) {
+		return event
+	}
+
+	switch event.Key() {
+	case tcell.KeyRune:
+		switch event.Rune() {
+		case ' ':
+			if m.running {
+				return nil
+			}
+			m.tests[index].Selected = !m.tests[index].Selected
+			m.refreshTestsTable()
+			return nil
+		case '\n':
+			m.showSelectedOutput(index)
+			return nil
+		}
+	case tcell.KeyEnter:
+		m.showSelectedOutput(index)
+		return nil
+	}
+	return event
+}
+
+func (m *appModel) setAllSelected(selected bool) {
+	for i := range m.tests {
+		m.tests[i].Selected = selected
+	}
+	m.refreshTestsTable()
+	if selected {
+		m.refreshStatus("All tests selected.")
 	} else {
-		results = append(results, commandResult{
-			Name:    "router_ping",
-			Command: "ping -c 30 <gateway>",
-			Skipped: true,
-			Err:     errors.New("gateway not detected"),
-		})
+		m.refreshStatus("All tests cleared.")
+	}
+}
+
+func (m *appModel) runSelected() {
+	selected := make([]int, 0, len(m.tests))
+	for i := range m.tests {
+		if m.tests[i].Selected {
+			selected = append(selected, i)
+		}
+	}
+	if len(selected) == 0 {
+		m.refreshStatus("No tests selected.")
+		return
 	}
 
-	if !isToolMissing(toolStatuses, "ping") {
-		results = append(results, runCommand("internet_ping", "ping", "-c", "30", "1.1.1.1"))
+	m.running = true
+	m.outputView.Clear()
+	m.refreshStatus(fmt.Sprintf("Running %d selected test(s). Press c to cancel.", len(selected)))
+
+	go func() {
+		for _, idx := range selected {
+			m.app.QueueUpdateDraw(func() {
+				m.runningIndex = idx
+				m.tests[idx].Status = "running"
+				m.refreshTestsTable()
+				m.outputView.Clear()
+				fmt.Fprintf(m.outputView, "$ %s\n\n", m.commandPreview(idx))
+				m.refreshStatus(fmt.Sprintf("Running: %s", m.tests[idx].Spec.Title))
+			})
+
+			ctx, cancel := context.WithCancel(context.Background())
+			m.cancelRun = cancel
+			result := m.executeTest(ctx, idx)
+			cancel()
+
+			m.app.QueueUpdateDraw(func() {
+				m.cancelRun = nil
+				m.runningIndex = -1
+				m.results[result.Name] = result
+				m.tests[idx].Result = result
+				if result.Skipped {
+					m.tests[idx].Status = "skipped"
+				} else if result.Err != nil {
+					m.tests[idx].Status = "error"
+				} else {
+					m.tests[idx].Status = "done"
+				}
+				m.refreshTestsTable()
+				m.refreshSummary()
+				m.showSelectedOutput(idx)
+			})
+
+			if errors.Is(result.Err, context.Canceled) {
+				break
+			}
+		}
+
+		m.app.QueueUpdateDraw(func() {
+			m.running = false
+			m.cancelRun = nil
+			m.runningIndex = -1
+			m.refreshSummary()
+			m.refreshStatus("Run complete. Use arrows to inspect command output, r to rerun.")
+		})
+	}()
+}
+
+func (m *appModel) executeTest(ctx context.Context, idx int) commandResult {
+	test := m.tests[idx]
+	if test.Spec.Tool != "" && isToolMissing(m.toolStatuses, test.Spec.Tool) {
+		return commandResult{
+			Name:    test.Spec.ID,
+			Command: test.Spec.Tool,
+			Skipped: true,
+			Err:     fmt.Errorf("missing required tool: %s", test.Spec.Tool),
+		}
+	}
+
+	display, bin, args, err := test.Spec.Command(m)
+	if err != nil {
+		return commandResult{
+			Name:    test.Spec.ID,
+			Command: display,
+			Skipped: true,
+			Err:     err,
+		}
+	}
+
+	result := runCommandStreaming(ctx, test.Spec.ID, display, bin, args, func(chunk string) {
+		m.app.QueueUpdateDraw(func() {
+			fmt.Fprint(m.outputView, chunk)
+		})
+	})
+	if test.Spec.Filter != nil {
+		result.Output = strings.TrimRight(test.Spec.Filter(m, result.Output), "\n")
+	}
+	if result.Output == "" && result.Err == nil {
+		result.Output = "(no matching output)"
+	}
+	return result
+}
+
+func runCommandStreaming(ctx context.Context, name, display, bin string, args []string, onChunk func(string)) commandResult {
+	start := time.Now()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	capture := &liveCapture{onChunk: onChunk}
+	cmd.Stdout = capture
+	cmd.Stderr = capture
+	err := cmd.Run()
+	duration := time.Since(start)
+
+	exitCode := 0
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else if errors.Is(err, context.Canceled) {
+			exitCode = -1
+		}
+	}
+
+	return commandResult{
+		Name:     name,
+		Command:  display,
+		Output:   strings.TrimRight(capture.String(), "\n"),
+		Err:      err,
+		Duration: duration,
+		ExitCode: exitCode,
+	}
+}
+
+func (m *appModel) commandPreview(idx int) string {
+	display, _, _, err := m.tests[idx].Spec.Command(m)
+	if err != nil {
+		return m.tests[idx].Spec.Title
+	}
+	return display
+}
+
+func (m *appModel) refreshTestsTable() {
+	headers := []string{"Sel", "Test", "Status"}
+	for col, header := range headers {
+		cell := tview.NewTableCell("[::b]" + header).
+			SetSelectable(false).
+			SetTextColor(tcell.ColorWhite)
+		m.testsTable.SetCell(0, col, cell)
+	}
+
+	for i, test := range m.tests {
+		check := "[ ]"
+		if test.Selected {
+			check = "[x]"
+		}
+
+		status := test.Status
+		color := "yellow"
+		switch status {
+		case "done":
+			color = "green"
+		case "error":
+			color = "red"
+		case "skipped":
+			color = "gray"
+		case "running":
+			color = "blue"
+		}
+
+		m.testsTable.SetCell(i+1, 0, tview.NewTableCell(check))
+		m.testsTable.SetCell(i+1, 1, tview.NewTableCell(test.Spec.Title))
+		m.testsTable.SetCell(i+1, 2, tview.NewTableCell(fmt.Sprintf("[%s]%s[-]", color, status)))
+	}
+}
+
+func (m *appModel) refreshSummary() {
+	results := make([]commandResult, 0, len(m.results))
+	for _, test := range m.tests {
+		if result, ok := m.results[test.Spec.ID]; ok {
+			results = append(results, result)
+		}
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Name < results[j].Name
+	})
+
+	diag := buildDiagnosis(m.iface, m.gateway, results)
+	var b strings.Builder
+	fmt.Fprintf(&b, "[::b]Adapter[::-]\n")
+	fmt.Fprintf(&b, "Chipset: [green]%s[-]\n", valueOrNA(diag.Adapter.Chipset))
+	fmt.Fprintf(&b, "Driver:  [green]%s[-]\n", valueOrNA(diag.Adapter.Driver))
+	fmt.Fprintf(&b, "SSID:    [green]%s[-]\n", valueOrNA(diag.Link.SSID))
+	if diag.Link.HasSignal {
+		fmt.Fprintf(&b, "Signal:  [green]%d dBm[-]\n", diag.Link.SignalDBm)
 	} else {
-		results = append(results, commandResult{
-			Name:    "internet_ping",
-			Command: "ping -c 30 1.1.1.1",
-			Skipped: true,
-			Err:     errors.New("missing required tool: ping"),
-		})
+		fmt.Fprintf(&b, "Signal:  [yellow]n/a[-]\n")
+	}
+	if diag.Station.HasRetryPct {
+		fmt.Fprintf(&b, "Retry:   [%s]%.1f%% (%s)[-]\n", severityTag(diag.Station.RetrySeverity), diag.Station.RetryPct, diag.Station.RetrySeverity)
+	} else {
+		fmt.Fprintf(&b, "Retry:   [yellow]n/a[-]\n")
+	}
+	if diag.RouterPing.HasRTT {
+		fmt.Fprintf(&b, "Router:  [%s]%.1f ms avg[-]\n", severityTag(latencySeverity(diag.RouterPing.AvgMs)), diag.RouterPing.AvgMs)
+	} else {
+		fmt.Fprintf(&b, "Router:  [yellow]n/a[-]\n")
+	}
+	fmt.Fprintf(&b, "\n[::b]Overall[::-] [%s::b]%s[-]\n", severityTag(diag.Overall), strings.ToUpper(valueOrNA(diag.Overall)))
+	if len(diag.Reasons) > 0 {
+		fmt.Fprintf(&b, "%s\n", diag.Reasons[0])
+	}
+	if missing := missingTools(m.toolStatuses); len(missing) > 0 {
+		fmt.Fprintf(&b, "\n[red]Missing tools:[-] %s\n", strings.Join(missing, ", "))
 	}
 
-	diag := buildDiagnosis(iface, gateway, results)
-	printReport(colors, iface, toolStatuses, diag, results)
+	m.summaryView.SetText(b.String())
+}
+
+func (m *appModel) refreshStatus(text string) {
+	help := "space: toggle  r: run  a: all  c: clear/cancel  q: quit"
+	m.statusView.SetText(fmt.Sprintf("[green]%s[-]\n[gray]%s[-]", text, help))
+}
+
+func (m *appModel) showSelectedOutput(idx int) {
+	if idx < 0 || idx >= len(m.tests) {
+		return
+	}
+	test := m.tests[idx]
+	m.outputView.Clear()
+	fmt.Fprintf(m.outputView, "$ %s\n\n", m.commandPreview(idx))
+	if result, ok := m.results[test.Spec.ID]; ok {
+		if result.Skipped {
+			fmt.Fprintf(m.outputView, "skipped: %v\n", result.Err)
+			return
+		}
+		if result.Err != nil && result.Output == "" {
+			fmt.Fprintf(m.outputView, "error: %v\n", result.Err)
+			return
+		}
+		if result.Output == "" {
+			fmt.Fprintln(m.outputView, "(no output)")
+			return
+		}
+		fmt.Fprintln(m.outputView, result.Output)
+		return
+	}
+	fmt.Fprintf(m.outputView, "(%s)\n", test.Spec.Description)
+}
+
+func defaultTests() []testState {
+	return []testState{
+		{Spec: testSpec{
+			ID:          "adapter_info",
+			Title:       "Adapter Info",
+			Description: "Driver, version, and firmware details.",
+			Tool:        "ethtool",
+			Command: func(m *appModel) (string, string, []string, error) {
+				return fmt.Sprintf("ethtool -i %s", m.iface), "ethtool", []string{"-i", m.iface}, nil
+			},
+		}},
+		{Spec: testSpec{
+			ID:          "link_status",
+			Title:       "Link Status",
+			Description: "Current SSID, BSSID, signal, and link rates.",
+			Tool:        "iw",
+			Command: func(m *appModel) (string, string, []string, error) {
+				return fmt.Sprintf("iw dev %s link", m.iface), "iw", []string{"dev", m.iface, "link"}, nil
+			},
+		}},
+		{Spec: testSpec{
+			ID:          "active_connection",
+			Title:       "Active Connection",
+			Description: "NetworkManager active connections.",
+			Tool:        "nmcli",
+			Command: func(*appModel) (string, string, []string, error) {
+				return "nmcli connection show --active", "nmcli", []string{"connection", "show", "--active"}, nil
+			},
+		}},
+		{Spec: testSpec{
+			ID:          "nearby_wifi",
+			Title:       "Nearby Networks",
+			Description: "Visible access points.",
+			Tool:        "nmcli",
+			Command: func(*appModel) (string, string, []string, error) {
+				return "nmcli -f IN-USE,SSID,BSSID,CHAN,RATE,SIGNAL dev wifi list", "nmcli", []string{"-f", "IN-USE,SSID,BSSID,CHAN,RATE,SIGNAL", "dev", "wifi", "list"}, nil
+			},
+		}},
+		{Spec: testSpec{
+			ID:          "power_save",
+			Title:       "Power Save",
+			Description: "Wi-Fi power save state.",
+			Tool:        "iw",
+			Command: func(m *appModel) (string, string, []string, error) {
+				return fmt.Sprintf("iw dev %s get power_save", m.iface), "iw", []string{"dev", m.iface, "get", "power_save"}, nil
+			},
+		}},
+		{Spec: testSpec{
+			ID:          "station_dump",
+			Title:       "Station Stats",
+			Description: "Station statistics and retry metrics.",
+			Tool:        "iw",
+			Command: func(m *appModel) (string, string, []string, error) {
+				return fmt.Sprintf("iw dev %s station dump", m.iface), "iw", []string{"dev", m.iface, "station", "dump"}, nil
+			},
+		}},
+		{Spec: testSpec{
+			ID:          "driver_stats",
+			Title:       "Driver Stats",
+			Description: "Driver-level transmit and receive statistics.",
+			Tool:        "ethtool",
+			Command: func(m *appModel) (string, string, []string, error) {
+				return fmt.Sprintf("ethtool -S %s", m.iface), "ethtool", []string{"-S", m.iface}, nil
+			},
+		}},
+		{Spec: testSpec{
+			ID:          "hardware_info",
+			Title:       "Hardware Info",
+			Description: "PCIe Wi-Fi chipset identification.",
+			Tool:        "lspci",
+			Command: func(*appModel) (string, string, []string, error) {
+				return "lspci -nnk", "lspci", []string{"-nnk"}, nil
+			},
+			Filter: func(_ *appModel, output string) string {
+				return filterHardwareInfo(output)
+			},
+		}},
+		{Spec: testSpec{
+			ID:          "pcie_errors",
+			Title:       "PCIe Error Check",
+			Description: "Kernel PCIe and AER error log review.",
+			Tool:        "dmesg",
+			Command: func(*appModel) (string, string, []string, error) {
+				return "dmesg", "dmesg", nil, nil
+			},
+			Filter: func(_ *appModel, output string) string {
+				return strings.Join(parsePCIeErrors(output), "\n")
+			},
+		}},
+		{Spec: testSpec{
+			ID:          "driver_logs",
+			Title:       "Driver Log Check",
+			Description: "Driver-specific error messages from dmesg.",
+			Tool:        "dmesg",
+			Command: func(m *appModel) (string, string, []string, error) {
+				driver := currentDriver(m)
+				if driver == "" {
+					return "dmesg", "", nil, errors.New("driver name unavailable; run Adapter Info first")
+				}
+				return fmt.Sprintf("dmesg (filtered for %s)", driver), "dmesg", nil, nil
+			},
+			Filter: func(m *appModel, output string) string {
+				return strings.Join(parseDriverLogs(output, currentDriver(m)), "\n")
+			},
+		}},
+		{Spec: testSpec{
+			ID:          "router_ping",
+			Title:       "Router Ping",
+			Description: "Latency and loss to the default gateway.",
+			Tool:        "ping",
+			Command: func(m *appModel) (string, string, []string, error) {
+				if m.gateway == "" {
+					return "ping -c 30 <gateway>", "", nil, errors.New("gateway not detected")
+				}
+				return fmt.Sprintf("ping -c 30 %s", m.gateway), "ping", []string{"-c", "30", m.gateway}, nil
+			},
+		}},
+		{Spec: testSpec{
+			ID:          "internet_ping",
+			Title:       "Internet Ping",
+			Description: "Latency and loss to 1.1.1.1.",
+			Tool:        "ping",
+			Command: func(*appModel) (string, string, []string, error) {
+				return "ping -c 30 1.1.1.1", "ping", []string{"-c", "30", "1.1.1.1"}, nil
+			},
+		}},
+	}
+}
+
+func currentDriver(m *appModel) string {
+	if result, ok := m.results["adapter_info"]; ok {
+		driver := parseDriver(result.Output)
+		if driver != "" {
+			return driver
+		}
+	}
+	return ""
 }
 
 func checkTools(names []string) []toolStatus {
@@ -406,6 +931,23 @@ func parseChipset(output string) string {
 		}
 	}
 	return ""
+}
+
+func filterHardwareInfo(output string) string {
+	lines := strings.Split(output, "\n")
+	var blocks []string
+	for i := 0; i < len(lines); i++ {
+		lower := strings.ToLower(lines[i])
+		if strings.Contains(lower, "network controller") || strings.Contains(lower, "wireless") {
+			end := i + 4
+			if end > len(lines) {
+				end = len(lines)
+			}
+			block := strings.Join(lines[i:end], "\n")
+			blocks = append(blocks, strings.TrimSpace(block))
+		}
+	}
+	return strings.Join(blocks, "\n\n")
 }
 
 func parseLinkInfo(output string) linkInfo {
@@ -683,168 +1225,17 @@ func assess(diag diagnosis) (string, []string, []string) {
 	return current.level, reasons, recs
 }
 
-func printReport(colors ansi, iface string, tools []toolStatus, diag diagnosis, results []commandResult) {
-	sep := strings.Repeat("=", 72)
-	line := strings.Repeat("-", 72)
-
-	fmt.Println(colors.Bold + sep)
-	fmt.Println("Wi-Fi Diagnostic Report")
-	fmt.Println(sep + colors.Reset)
-
-	printSection(colors, "Runtime")
-	fmt.Printf("Interface: %s\n", iface)
-	if diag.Gateway != "" {
-		fmt.Printf("Gateway:   %s\n", diag.Gateway)
-	}
-	fmt.Println()
-
-	printSection(colors, "Dependencies")
-	for _, tool := range tools {
-		status := colorizeStatus(colors, !tool.Missing)
-		path := tool.Path
-		if path == "" {
-			path = "missing"
-		}
-		fmt.Printf("%-10s %s (%s)\n", tool.Name+":", status, path)
-	}
-	fmt.Println()
-
-	printSection(colors, "Adapter")
-	fmt.Printf("Chipset:   %s\n", valueOrNA(diag.Adapter.Chipset))
-	fmt.Printf("Driver:    %s\n", valueOrNA(diag.Adapter.Driver))
-	fmt.Printf("Version:   %s\n", valueOrNA(diag.Adapter.Version))
-	fmt.Printf("Firmware:  %s\n", valueOrNA(diag.Adapter.Firmware))
-	fmt.Println()
-
-	printSection(colors, "Connection")
-	fmt.Printf("SSID:      %s\n", valueOrNA(diag.Link.SSID))
-	fmt.Printf("BSSID:     %s\n", valueOrNA(diag.Link.BSSID))
-	fmt.Printf("Frequency: %s\n", valueOrNA(diag.Link.Frequency))
-	fmt.Printf("Signal:    %s\n", signalString(diag.Link))
-	fmt.Printf("RX Rate:   %s\n", valueOrNA(diag.Link.RxBitrate))
-	fmt.Printf("TX Rate:   %s\n", valueOrNA(diag.Link.TxBitrate))
-	fmt.Println()
-
-	printSection(colors, "Health")
-	if diag.Station.HasRetryPct {
-		fmt.Printf("Retry Rate:        %.1f%% (%s)\n", diag.Station.RetryPct, diag.Station.RetrySeverity)
-	} else {
-		fmt.Printf("Retry Rate:        n/a\n")
-	}
-	if diag.Driver.HasSuccessRate {
-		fmt.Printf("Transmit Success:  %.1f%%\n", diag.Driver.TxSuccessRate)
-	} else {
-		fmt.Printf("Transmit Success:  n/a\n")
-	}
-	fmt.Printf("Power Save:        %s\n", strings.ToUpper(valueOrNA(diag.PowerSave)))
-	fmt.Printf("PCIe Errors:       %d\n", len(diag.PCIeErrors))
-	fmt.Printf("Driver Log Issues: %d\n", len(diag.DriverLogIssues))
-	fmt.Println()
-
-	printPingSection(colors, "Router Ping", diag.RouterPing)
-	printPingSection(colors, "Internet Ping", diag.InternetPing)
-
-	printSection(colors, "Overall Assessment")
-	fmt.Println(severityColor(colors, diag.Overall) + strings.ToUpper(diag.Overall) + colors.Reset)
-	fmt.Println()
-	fmt.Println("Reasons:")
-	for _, reason := range diag.Reasons {
-		fmt.Printf("- %s\n", reason)
-	}
-	fmt.Println()
-	fmt.Println("Recommendations:")
-	for _, rec := range diag.Recommendations {
-		fmt.Printf("- %s\n", rec)
-	}
-	fmt.Println()
-
-	printSection(colors, "Active Connections")
-	fmt.Println(valueOrNA(diag.ActiveConnections))
-	fmt.Println()
-
-	printSection(colors, "Nearby Wi-Fi Networks")
-	fmt.Println(valueOrNA(diag.NearbyNetworks))
-	fmt.Println()
-
-	fmt.Println(colors.Bold + line)
-	fmt.Println("Raw Diagnostics")
-	fmt.Println(line + colors.Reset)
-	for _, result := range results {
-		fmt.Printf("%s$ %s%s\n", colors.Cyan, result.Command, colors.Reset)
-		if result.Skipped {
-			fmt.Printf("%sskipped: %v%s\n\n", colors.Yellow, result.Err, colors.Reset)
-			continue
-		}
-		if result.Err != nil {
-			fmt.Printf("%serror (exit %d): %v%s\n", colors.Red, result.ExitCode, result.Err, colors.Reset)
-			if result.Output != "" {
-				fmt.Println(result.Output)
-			}
-			fmt.Println()
-			continue
-		}
-		if result.Output == "" {
-			fmt.Printf("%s(no output)%s\n\n", colors.Dim, colors.Reset)
-			continue
-		}
-		fmt.Println(result.Output)
-		fmt.Println()
-	}
-}
-
-func printSection(colors ansi, title string) {
-	line := strings.Repeat("-", 72)
-	fmt.Println(colors.Bold + title)
-	fmt.Println(line + colors.Reset)
-}
-
-func printPingSection(colors ansi, title string, stats pingStats) {
-	printSection(colors, title)
-	if !stats.HasRTT && !stats.HasPacketLoss {
-		fmt.Println("n/a")
-		fmt.Println()
-		return
-	}
-	if stats.HasRTT {
-		fmt.Printf("Target: %s\n", stats.Target)
-		fmt.Printf("Min:    %.1f ms\n", stats.MinMs)
-		fmt.Printf("Avg:    %.1f ms\n", stats.AvgMs)
-		fmt.Printf("Max:    %.1f ms\n", stats.MaxMs)
-		fmt.Printf("Mdev:   %.1f ms\n", stats.MdevMs)
-	}
-	if stats.HasPacketLoss {
-		fmt.Printf("Loss:   %.1f%%\n", stats.PacketLoss)
-	}
-	fmt.Println()
-}
-
-func colorizeStatus(colors ansi, ok bool) string {
-	if ok {
-		return colors.Green + "OK" + colors.Reset
-	}
-	return colors.Red + "MISSING" + colors.Reset
-}
-
-func severityColor(colors ansi, severity string) string {
+func severityTag(severity string) string {
 	switch severity {
-	case "Excellent":
-		return colors.Green
-	case "Good":
-		return colors.Cyan
+	case "Excellent", "Good":
+		return "green"
 	case "Fair":
-		return colors.Yellow
+		return "yellow"
 	case "Poor", "Severe":
-		return colors.Red
+		return "red"
 	default:
-		return colors.Magenta
+		return "white"
 	}
-}
-
-func signalString(link linkInfo) string {
-	if !link.HasSignal {
-		return "n/a"
-	}
-	return fmt.Sprintf("%d dBm", link.SignalDBm)
 }
 
 func valueOrNA(value string) string {
@@ -939,7 +1330,4 @@ func uniqueStrings(items []string) []string {
 	return out
 }
 
-func fatalf(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "error: "+format+"\n", args...)
-	os.Exit(1)
-}
+var _ io.Writer = (*liveCapture)(nil)
