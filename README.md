@@ -8,6 +8,8 @@ It detects the active wireless interface, lets you choose which diagnostics to r
 
 - interactive TUI with selectable diagnostics
 - live command output panel
+- copy button for the currently selected command output
+- JSON export button for completed diagnostics
 - parsed summary for signal, retry rate, latency, and overall health
 - dependency checks for required system tools
 - root-only execution for commands that need elevated access
@@ -27,6 +29,12 @@ It detects the active wireless interface, lets you choose which diagnostics to r
   - `dmesg`
 
 If a tool is missing, the TUI shows that in the summary and skips the affected diagnostics.
+
+Clipboard copy uses the first available tool from:
+
+- `wl-copy`
+- `xclip`
+- `xsel`
 
 ## Build
 
@@ -49,11 +57,19 @@ sudo ./wifi-diag --iface wlp11s0
 ## Controls
 
 - `Up` / `Down`: move through diagnostics
-- `Space`: select or clear a diagnostic
+- `Space`: toggle a diagnostic between `[*]` selected and `[ ]` not selected
 - `r`: run selected diagnostics
 - `a`: select all diagnostics
 - `c`: clear all diagnostics, or cancel the current run
+- `y`: copy the selected command output
+- `j`: save a JSON report
 - `q`: quit
+
+The TUI also provides clickable buttons for:
+
+- `Run Selected`
+- `Copy Output`
+- `Save JSON`
 
 ## Diagnostics
 
@@ -77,8 +93,10 @@ The default ping count is `10` packets for both router and internet latency test
 ## Interface Layout
 
 - left pane: diagnostic checklist and per-test status
+- diagnostics default to selected and show `[*]`; deselected diagnostics show `[ ]`
 - upper-right pane: parsed summary and overall assessment
 - lower-right pane: live output from the selected command
+- output pane is plain text; it does not apply color formatting to command output
 
 ## Notes
 

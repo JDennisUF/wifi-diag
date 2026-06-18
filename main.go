@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -31,6 +32,26 @@ type commandResult struct {
 	ExitCode  int
 	Skipped   bool
 	ParseNote string
+}
+
+type jsonReport struct {
+	GeneratedAt  time.Time             `json:"generated_at"`
+	Interface    string                `json:"interface"`
+	Gateway      string                `json:"gateway,omitempty"`
+	ToolStatuses []toolStatus          `json:"tool_statuses"`
+	Diagnosis    diagnosis             `json:"diagnosis"`
+	Results      map[string]jsonResult `json:"results"`
+}
+
+type jsonResult struct {
+	Name      string        `json:"name"`
+	Command   string        `json:"command"`
+	Output    string        `json:"output"`
+	Error     string        `json:"error,omitempty"`
+	Duration  time.Duration `json:"duration"`
+	ExitCode  int           `json:"exit_code"`
+	Skipped   bool          `json:"skipped"`
+	ParseNote string        `json:"parse_note,omitempty"`
 }
 
 type toolStatus struct {
@@ -164,6 +185,7 @@ type appModel struct {
 	outputView  *tview.TextView
 	summaryView *tview.TextView
 	statusView  *tview.TextView
+	buttonBar   *tview.Flex
 
 	iface        string
 	gateway      string
@@ -258,7 +280,7 @@ func newAppModel(app *tview.Application, iface, gateway string, toolStatuses []t
 	model.summaryView.SetBorder(true).SetTitle(" Summary ").SetTitleAlign(tview.AlignLeft)
 
 	model.outputView = tview.NewTextView().
-		SetDynamicColors(true).
+		SetDynamicColors(false).
 		SetScrollable(true).
 		SetWrap(false)
 	model.outputView.SetBorder(true).SetTitle(" Command Output ").SetTitleAlign(tview.AlignLeft)
@@ -267,6 +289,7 @@ func newAppModel(app *tview.Application, iface, gateway string, toolStatuses []t
 		SetDynamicColors(true).
 		SetWrap(false)
 	model.statusView.SetBorder(true)
+	model.buttonBar = model.newButtonBar()
 
 	model.refreshTestsTable()
 	model.refreshSummary()
@@ -285,6 +308,7 @@ func (m *appModel) layout() tview.Primitive {
 
 	right := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(m.summaryView, 14, 0, false).
+		AddItem(m.buttonBar, 3, 0, false).
 		AddItem(m.outputView, 0, 1, false)
 
 	body := tview.NewFlex().
@@ -331,6 +355,12 @@ func (m *appModel) handleGlobalKeys(event *tcell.EventKey) *tcell.EventKey {
 		} else if m.cancelRun != nil {
 			m.cancelRun()
 		}
+		return nil
+	case 'y':
+		m.copySelectedOutput()
+		return nil
+	case 'j':
+		m.saveJSONReport()
 		return nil
 	}
 
@@ -531,7 +561,7 @@ func (m *appModel) refreshTestsTable() {
 	for i, test := range m.tests {
 		check := "[ ]"
 		if test.Selected {
-			check = "[x]"
+			check = "[*]"
 		}
 
 		status := test.Status
@@ -597,7 +627,7 @@ func (m *appModel) refreshSummary() {
 }
 
 func (m *appModel) refreshStatus(text string) {
-	help := "space: toggle  r: run  a: all  c: clear/cancel  q: quit"
+	help := "space: toggle  r: run  a: all  c: clear/cancel  y: copy output  j: save json  q: quit"
 	m.statusView.SetText(fmt.Sprintf("[green]%s[-]\n[gray]%s[-]", text, help))
 }
 
@@ -629,6 +659,156 @@ func (m *appModel) showSelectedOutput(idx int) {
 		return
 	}
 	fmt.Fprintf(m.outputView, "(%s)\n", test.Spec.Description)
+}
+
+func (m *appModel) newButtonBar() *tview.Flex {
+	runButton := tview.NewButton("Run Selected").SetSelectedFunc(func() {
+		if !m.running {
+			m.runSelected()
+		}
+	})
+	copyButton := tview.NewButton("Copy Output").SetSelectedFunc(func() {
+		m.copySelectedOutput()
+	})
+	jsonButton := tview.NewButton("Save JSON").SetSelectedFunc(func() {
+		m.saveJSONReport()
+	})
+
+	for _, button := range []*tview.Button{runButton, copyButton, jsonButton} {
+		button.SetBackgroundColor(tcell.Color25)
+		button.SetLabelColor(tcell.ColorWhite)
+		button.SetLabelColorActivated(tcell.ColorBlack)
+	}
+
+	return tview.NewFlex().
+		AddItem(runButton, 0, 1, false).
+		AddItem(copyButton, 0, 1, false).
+		AddItem(jsonButton, 0, 1, false)
+}
+
+func (m *appModel) currentOutputText() string {
+	if m.selectedRow < 0 || m.selectedRow >= len(m.tests) {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "$ %s\n\n", m.commandPreview(m.selectedRow))
+	test := m.tests[m.selectedRow]
+	if liveOutput := m.liveOutputs[test.Spec.ID]; liveOutput != "" && test.Status == "running" {
+		b.WriteString(liveOutput)
+		return b.String()
+	}
+	if result, ok := m.results[test.Spec.ID]; ok {
+		if result.Skipped {
+			fmt.Fprintf(&b, "skipped: %v\n", result.Err)
+			return b.String()
+		}
+		if result.Err != nil && result.Output == "" {
+			fmt.Fprintf(&b, "error: %v\n", result.Err)
+			return b.String()
+		}
+		if result.Output == "" {
+			b.WriteString("(no output)\n")
+			return b.String()
+		}
+		b.WriteString(result.Output)
+		if !strings.HasSuffix(result.Output, "\n") {
+			b.WriteByte('\n')
+		}
+		return b.String()
+	}
+	fmt.Fprintf(&b, "(%s)\n", test.Spec.Description)
+	return b.String()
+}
+
+func (m *appModel) copySelectedOutput() {
+	output := m.currentOutputText()
+	if strings.TrimSpace(output) == "" {
+		m.refreshStatus("Nothing to copy for the selected test.")
+		return
+	}
+	if err := copyToClipboard(output); err != nil {
+		m.refreshStatus(fmt.Sprintf("Copy failed: %v", err))
+		return
+	}
+	m.refreshStatus("Selected command output copied to clipboard.")
+}
+
+func (m *appModel) saveJSONReport() {
+	report := jsonReport{
+		GeneratedAt:  time.Now(),
+		Interface:    m.iface,
+		Gateway:      m.gateway,
+		ToolStatuses: m.toolStatuses,
+		Diagnosis:    buildDiagnosis(m.iface, m.gateway, m.sortedResults()),
+		Results:      m.exportResults(),
+	}
+	data, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		m.refreshStatus(fmt.Sprintf("JSON export failed: %v", err))
+		return
+	}
+	filename := fmt.Sprintf("wifi-diag-report-%s.json", time.Now().Format("20060102-150405"))
+	if err := os.WriteFile(filename, append(data, '\n'), 0o644); err != nil {
+		m.refreshStatus(fmt.Sprintf("JSON export failed: %v", err))
+		return
+	}
+	m.refreshStatus(fmt.Sprintf("JSON report saved to %s", filename))
+}
+
+func (m *appModel) sortedResults() []commandResult {
+	results := make([]commandResult, 0, len(m.results))
+	for _, test := range m.tests {
+		if result, ok := m.results[test.Spec.ID]; ok {
+			results = append(results, result)
+		}
+	}
+	return results
+}
+
+func (m *appModel) exportResults() map[string]jsonResult {
+	exported := make(map[string]jsonResult, len(m.results))
+	for key, result := range m.results {
+		exported[key] = jsonResult{
+			Name:      result.Name,
+			Command:   result.Command,
+			Output:    result.Output,
+			Error:     errorString(result.Err),
+			Duration:  result.Duration,
+			ExitCode:  result.ExitCode,
+			Skipped:   result.Skipped,
+			ParseNote: result.ParseNote,
+		}
+	}
+	return exported
+}
+
+func copyToClipboard(text string) error {
+	candidates := []struct {
+		bin  string
+		args []string
+	}{
+		{bin: "wl-copy"},
+		{bin: "xclip", args: []string{"-selection", "clipboard"}},
+		{bin: "xsel", args: []string{"--clipboard", "--input"}},
+	}
+	for _, candidate := range candidates {
+		if _, err := exec.LookPath(candidate.bin); err != nil {
+			continue
+		}
+		cmd := exec.Command(candidate.bin, candidate.args...)
+		cmd.Stdin = strings.NewReader(text)
+		if err := cmd.Run(); err == nil {
+			return nil
+		}
+	}
+	return errors.New("no supported clipboard tool found (tried wl-copy, xclip, xsel)")
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func defaultTests() []testState {
