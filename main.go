@@ -171,6 +171,8 @@ type appModel struct {
 	tests        []testState
 	testIndex    map[string]int
 	results      map[string]commandResult
+	liveOutputs  map[string]string
+	selectedRow  int
 
 	running      bool
 	runningIndex int
@@ -223,6 +225,8 @@ func newAppModel(app *tview.Application, iface, gateway string, toolStatuses []t
 		toolStatuses: toolStatuses,
 		testIndex:    map[string]int{},
 		results:      map[string]commandResult{},
+		liveOutputs:  map[string]string{},
+		selectedRow:  0,
 		runningIndex: -1,
 	}
 
@@ -243,6 +247,7 @@ func newAppModel(app *tview.Application, iface, gateway string, toolStatuses []t
 		if row <= 0 || row-1 >= len(model.tests) {
 			return
 		}
+		model.selectedRow = row - 1
 		model.showSelectedOutput(row - 1)
 	})
 	model.testsTable.SetInputCapture(model.handleTableKeys)
@@ -385,7 +390,6 @@ func (m *appModel) runSelected() {
 	}
 
 	m.running = true
-	m.outputView.Clear()
 	m.refreshStatus(fmt.Sprintf("Running %d selected test(s). Press c to cancel.", len(selected)))
 
 	go func() {
@@ -393,9 +397,11 @@ func (m *appModel) runSelected() {
 			m.app.QueueUpdateDraw(func() {
 				m.runningIndex = idx
 				m.tests[idx].Status = "running"
+				m.liveOutputs[m.tests[idx].Spec.ID] = ""
 				m.refreshTestsTable()
-				m.outputView.Clear()
-				fmt.Fprintf(m.outputView, "$ %s\n\n", m.commandPreview(idx))
+				if m.selectedRow == idx {
+					m.showSelectedOutput(idx)
+				}
 				m.refreshStatus(fmt.Sprintf("Running: %s", m.tests[idx].Spec.Title))
 			})
 
@@ -418,7 +424,9 @@ func (m *appModel) runSelected() {
 				}
 				m.refreshTestsTable()
 				m.refreshSummary()
-				m.showSelectedOutput(idx)
+				if m.selectedRow == idx {
+					m.showSelectedOutput(idx)
+				}
 			})
 
 			if errors.Is(result.Err, context.Canceled) {
@@ -459,7 +467,10 @@ func (m *appModel) executeTest(ctx context.Context, idx int) commandResult {
 
 	result := runCommandStreaming(ctx, test.Spec.ID, display, bin, args, func(chunk string) {
 		m.app.QueueUpdateDraw(func() {
-			fmt.Fprint(m.outputView, chunk)
+			m.liveOutputs[test.Spec.ID] += chunk
+			if m.selectedRow == idx {
+				m.showSelectedOutput(idx)
+			}
 		})
 	})
 	if test.Spec.Filter != nil {
@@ -597,6 +608,10 @@ func (m *appModel) showSelectedOutput(idx int) {
 	test := m.tests[idx]
 	m.outputView.Clear()
 	fmt.Fprintf(m.outputView, "$ %s\n\n", m.commandPreview(idx))
+	if liveOutput := m.liveOutputs[test.Spec.ID]; liveOutput != "" && test.Status == "running" {
+		fmt.Fprint(m.outputView, liveOutput)
+		return
+	}
 	if result, ok := m.results[test.Spec.ID]; ok {
 		if result.Skipped {
 			fmt.Fprintf(m.outputView, "skipped: %v\n", result.Err)
