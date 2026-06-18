@@ -728,9 +728,9 @@ func defaultTests() []testState {
 			Tool:        "ping",
 			Command: func(m *appModel) (string, string, []string, error) {
 				if m.gateway == "" {
-					return "ping -c 30 <gateway>", "", nil, errors.New("gateway not detected")
+					return "ping -c 10 <gateway>", "", nil, errors.New("gateway not detected")
 				}
-				return fmt.Sprintf("ping -c 30 %s", m.gateway), "ping", []string{"-c", "30", m.gateway}, nil
+				return fmt.Sprintf("ping -c 10 %s", m.gateway), "ping", []string{"-c", "10", m.gateway}, nil
 			},
 		}},
 		{Spec: testSpec{
@@ -739,7 +739,7 @@ func defaultTests() []testState {
 			Description: "Latency and loss to 1.1.1.1.",
 			Tool:        "ping",
 			Command: func(*appModel) (string, string, []string, error) {
-				return "ping -c 30 1.1.1.1", "ping", []string{"-c", "30", "1.1.1.1"}, nil
+				return "ping -c 10 1.1.1.1", "ping", []string{"-c", "10", "1.1.1.1"}, nil
 			},
 		}},
 	}
